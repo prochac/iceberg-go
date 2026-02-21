@@ -19,7 +19,6 @@ package io
 
 import (
 	"context"
-	"errors"
 	"fmt"
 	"net/http"
 	"net/url"
@@ -65,10 +64,12 @@ func ParseAWSConfig(ctx context.Context, props map[string]string) (*aws.Config, 
 		}
 	}
 
-	// Remote S3 request signing is not implemented yet.
-	if v, ok := props[S3RemoteSigningEnabled]; ok {
-		if enabled, err := strconv.ParseBool(v); err == nil && enabled {
-			return nil, errors.New("remote S3 request signing is not supported")
+	remoteSigningEnabled := isRemoteSigningEnabled(props)
+
+	// When remote signing is enabled, validate that the signer URI is provided.
+	if remoteSigningEnabled {
+		if _, ok := props[S3SignerUri]; !ok {
+			return nil, fmt.Errorf("property %q is required when %q is enabled", S3SignerUri, S3RemoteSigningEnabled)
 		}
 	}
 
@@ -85,11 +86,20 @@ func ParseAWSConfig(ctx context.Context, props map[string]string) (*aws.Config, 
 		opts = append(opts, config.WithRegion(region))
 	}
 
-	accessKey, secretAccessKey := props[S3AccessKeyID], props[S3SecretAccessKey]
-	token := props[S3SessionToken]
-	if accessKey != "" || secretAccessKey != "" || token != "" {
-		opts = append(opts, config.WithCredentialsProvider(credentials.NewStaticCredentialsProvider(
-			props[S3AccessKeyID], props[S3SecretAccessKey], props[S3SessionToken])))
+	if remoteSigningEnabled {
+		// When remote signing is enabled, provide placeholder credentials
+		// so the SDK does not attempt to resolve credentials from the
+		// environment. The actual request signing is handled by the
+		// signingRoundTripper which delegates to the remote endpoint.
+		opts = append(opts, config.WithCredentialsProvider(
+			credentials.NewStaticCredentialsProvider("remote-signing", "remote-signing", "")))
+	} else {
+		accessKey, secretAccessKey := props[S3AccessKeyID], props[S3SecretAccessKey]
+		token := props[S3SessionToken]
+		if accessKey != "" || secretAccessKey != "" || token != "" {
+			opts = append(opts, config.WithCredentialsProvider(credentials.NewStaticCredentialsProvider(
+				props[S3AccessKeyID], props[S3SecretAccessKey], props[S3SessionToken])))
+		}
 	}
 
 	if proxy, ok := props[S3ProxyURI]; ok {
@@ -147,6 +157,26 @@ func createS3Bucket(ctx context.Context, parsed *url.URL, props map[string]strin
 		}
 		o.UsePathStyle = usePathStyle
 		o.DisableLogOutputChecksumValidationSkipped = true
+
+		// When remote signing is enabled, inject a transport that
+		// delegates S3 request signing to the REST catalog endpoint.
+		if isRemoteSigningEnabled(props) {
+			base := http.DefaultTransport
+			if proxyURI, ok := props[S3ProxyURI]; ok {
+				if proxyURL, err := url.Parse(proxyURI); err == nil {
+					base = &http.Transport{Proxy: http.ProxyURL(proxyURL)}
+				}
+			}
+
+			o.HTTPClient = &http.Client{
+				Transport: &signingRoundTripper{
+					base:      base,
+					signerURI: signerEndpoint(props[S3SignerUri]),
+					token:     props["token"],
+					region:    awscfg.Region,
+				},
+			}
+		}
 	})
 
 	// Create a *blob.Bucket.
@@ -156,4 +186,16 @@ func createS3Bucket(ctx context.Context, parsed *url.URL, props map[string]strin
 	}
 
 	return bucket, nil
+}
+
+// isRemoteSigningEnabled returns true if the s3.remote-signing-enabled
+// property is set to "true" in the given properties.
+func isRemoteSigningEnabled(props map[string]string) bool {
+	if v, ok := props[S3RemoteSigningEnabled]; ok {
+		if enabled, err := strconv.ParseBool(v); err == nil {
+			return enabled
+		}
+	}
+
+	return false
 }
