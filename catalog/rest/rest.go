@@ -397,6 +397,8 @@ func fromProps(props iceberg.Properties, o *options) {
 				continue
 			}
 			o.authUri = u
+		case keyOauthToken:
+			o.oauthToken = v
 		case keyOauthCredential:
 			o.credential = v
 		case keyScope:
@@ -434,6 +436,7 @@ func toProps(o *options) iceberg.Properties {
 		}
 	}
 
+	setIf(keyOauthToken, o.oauthToken)
 	setIf(keyOauthCredential, o.credential)
 	setIf(keyWarehouseLocation, o.warehouseLocation)
 	setIf(keyMetadataLocation, o.metadataLocation)
@@ -455,8 +458,9 @@ type Catalog struct {
 	baseURI *url.URL
 	cl      *http.Client
 
-	name  string
-	props iceberg.Properties
+	name        string
+	props       iceberg.Properties
+	authManager AuthManager
 }
 
 func newCatalogFromProps(ctx context.Context, name string, uri string, p iceberg.Properties) (*Catalog, error) {
@@ -521,6 +525,7 @@ func (r *Catalog) init(ctx context.Context, ops *options, uri string) error {
 		r.baseURI = r.baseURI.JoinPath(ops.prefix)
 	}
 	r.props = toProps(ops)
+	r.authManager = ops.authManager
 
 	return nil
 }
@@ -631,11 +636,29 @@ func checkValidNamespace(ident table.Identifier) error {
 }
 
 func (r *Catalog) tableFromResponse(ctx context.Context, identifier []string, metadata table.Metadata, loc string, config iceberg.Properties) (*table.Table, error) {
+	fsFunc := iceio.LoadFSFunc(config, loc)
+	if r.authManager != nil {
+		am := r.authManager
+		baseFsFunc := fsFunc
+		fsFunc = func(ctx context.Context) (iceio.IO, error) {
+			tp := func() (string, error) {
+				_, v, err := am.AuthHeader()
+				if err != nil {
+					return "", err
+				}
+
+				return strings.TrimPrefix(v, "Bearer "), nil
+			}
+
+			return baseFsFunc(iceio.WithSigningTokenProvider(ctx, tp))
+		}
+	}
+
 	return table.New(
 		identifier,
 		metadata,
 		loc,
-		iceio.LoadFSFunc(config, loc),
+		fsFunc,
 		r,
 	), nil
 }
